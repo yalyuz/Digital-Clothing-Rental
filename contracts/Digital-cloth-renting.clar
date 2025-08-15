@@ -8,9 +8,13 @@
 (define-constant err-unauthorized (err u106))
 (define-constant err-invalid-duration (err u107))
 (define-constant err-outfit-not-available (err u108))
+(define-constant err-already-reviewed (err u109))
+(define-constant err-rental-not-completed (err u110))
+(define-constant err-invalid-rating (err u111))
 
 (define-data-var next-outfit-id uint u1)
 (define-data-var next-rental-id uint u1)
+(define-data-var next-review-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var current-time uint u0)
 
@@ -47,6 +51,32 @@
 (define-map outfit-rental-history
   { outfit-id: uint }
   { rental-count: uint, total-revenue: uint }
+)
+
+(define-map outfit-reviews
+  { review-id: uint }
+  {
+    outfit-id: uint,
+    rental-id: uint,
+    reviewer: principal,
+    rating: uint,
+    comment: (string-utf8 512),
+    review-time: uint
+  }
+)
+
+(define-map outfit-ratings
+  { outfit-id: uint }
+  {
+    total-ratings: uint,
+    sum-ratings: uint,
+    average-rating: uint
+  }
+)
+
+(define-map rental-reviews
+  { rental-id: uint }
+  { review-id: uint }
 )
 
 (define-public (create-outfit 
@@ -236,6 +266,57 @@
   )
 )
 
+(define-public (submit-review (rental-id uint) (rating uint) (comment (string-utf8 512)))
+  (let (
+    (rental (unwrap! (map-get? rentals { rental-id: rental-id }) err-not-found))
+    (review-id (var-get next-review-id))
+    (outfit-id (get outfit-id rental))
+    (current-timestamp (var-get current-time))
+  )
+    (asserts! (is-eq tx-sender (get renter rental)) err-unauthorized)
+    (asserts! (not (get active rental)) err-rental-not-completed)
+    (asserts! (is-none (map-get? rental-reviews { rental-id: rental-id })) err-already-reviewed)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    
+    (map-set outfit-reviews
+      { review-id: review-id }
+      {
+        outfit-id: outfit-id,
+        rental-id: rental-id,
+        reviewer: tx-sender,
+        rating: rating,
+        comment: comment,
+        review-time: current-timestamp
+      }
+    )
+    
+    (map-set rental-reviews
+      { rental-id: rental-id }
+      { review-id: review-id }
+    )
+    
+    (let ((current-ratings (default-to { total-ratings: u0, sum-ratings: u0, average-rating: u0 } 
+                                      (map-get? outfit-ratings { outfit-id: outfit-id }))))
+      (let (
+        (new-total (+ (get total-ratings current-ratings) u1))
+        (new-sum (+ (get sum-ratings current-ratings) rating))
+      )
+        (map-set outfit-ratings
+          { outfit-id: outfit-id }
+          {
+            total-ratings: new-total,
+            sum-ratings: new-sum,
+            average-rating: (/ (* new-sum u100) new-total)
+          }
+        )
+      )
+    )
+    
+    (var-set next-review-id (+ review-id u1))
+    (ok review-id)
+  )
+)
+
 (define-read-only (get-outfit (outfit-id uint))
   (map-get? outfits { outfit-id: outfit-id })
 )
@@ -298,6 +379,25 @@
 
 (define-read-only (get-next-rental-id)
   (var-get next-rental-id)
+)
+
+(define-read-only (get-review (review-id uint))
+  (map-get? outfit-reviews { review-id: review-id })
+)
+
+(define-read-only (get-outfit-rating (outfit-id uint))
+  (map-get? outfit-ratings { outfit-id: outfit-id })
+)
+
+(define-read-only (get-rental-review (rental-id uint))
+  (match (map-get? rental-reviews { rental-id: rental-id })
+    review-data (map-get? outfit-reviews { review-id: (get review-id review-data) })
+    none
+  )
+)
+
+(define-read-only (get-next-review-id)
+  (var-get next-review-id)
 )
 
 (define-private (remove-rental-id (id uint))
