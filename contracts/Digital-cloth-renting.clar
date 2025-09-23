@@ -11,12 +11,19 @@
 (define-constant err-already-reviewed (err u109))
 (define-constant err-rental-not-completed (err u110))
 (define-constant err-invalid-rating (err u111))
+(define-constant err-invalid-surge-rate (err u112))
+(define-constant err-cooldown-period (err u113))
 
 (define-data-var next-outfit-id uint u1)
 (define-data-var next-rental-id uint u1)
 (define-data-var next-review-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var current-time uint u0)
+(define-data-var surge-threshold uint u3)
+(define-data-var surge-multiplier uint u150)
+(define-data-var discount-threshold uint u7)
+(define-data-var discount-percentage uint u80)
+(define-data-var price-update-cooldown uint u24)
 
 (define-map outfits
   { outfit-id: uint }
@@ -79,6 +86,110 @@
   { review-id: uint }
 )
 
+(define-map outfit-demand-metrics
+  { outfit-id: uint }
+  {
+    recent-rental-count: uint,
+    last-rental-time: uint,
+    price-tier: uint,
+    surge-active: bool,
+    discount-active: bool,
+    last-price-update: uint
+  }
+)
+
+(define-map outfit-price-history
+  { outfit-id: uint, timestamp: uint }
+  {
+    base-price: uint,
+    adjusted-price: uint,
+    adjustment-type: (string-utf8 16)
+  }
+)
+
+(define-map weekly-rental-tracker
+  { outfit-id: uint, week-number: uint }
+  { rental-count: uint }
+)
+
+(define-private (get-current-week)
+  (/ (var-get current-time) u168)
+)
+
+(define-private (update-demand-metrics (outfit-id uint))
+  (let (
+    (current-week (get-current-week))
+    (metrics (default-to
+      {
+        recent-rental-count: u0,
+        last-rental-time: u0,
+        price-tier: u1,
+        surge-active: false,
+        discount-active: false,
+        last-price-update: u0
+      }
+      (map-get? outfit-demand-metrics { outfit-id: outfit-id })))
+    (weekly-rentals (default-to { rental-count: u0 }
+      (map-get? weekly-rental-tracker { outfit-id: outfit-id, week-number: current-week })))
+    (new-rental-count (+ (get rental-count weekly-rentals) u1))
+  )
+    (map-set weekly-rental-tracker
+      { outfit-id: outfit-id, week-number: current-week }
+      { rental-count: new-rental-count }
+    )
+    
+    (let (
+      (should-surge (>= new-rental-count (var-get surge-threshold)))
+      (should-discount (and 
+        (< new-rental-count u2)
+        (>= (- (var-get current-time) (get last-rental-time metrics)) (var-get discount-threshold))
+      ))
+    )
+      (map-set outfit-demand-metrics
+        { outfit-id: outfit-id }
+        {
+          recent-rental-count: new-rental-count,
+          last-rental-time: (var-get current-time),
+          price-tier: (if should-surge u3 (if should-discount u0 u1)),
+          surge-active: should-surge,
+          discount-active: should-discount,
+          last-price-update: (var-get current-time)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-dynamic-price (outfit-id uint))
+  (let (
+    (outfit (unwrap! (map-get? outfits { outfit-id: outfit-id }) none))
+    (base-price (get rental-price-per-hour outfit))
+    (metrics (default-to
+      {
+        recent-rental-count: u0,
+        last-rental-time: u0,
+        price-tier: u1,
+        surge-active: false,
+        discount-active: false,
+        last-price-update: u0
+      }
+      (map-get? outfit-demand-metrics { outfit-id: outfit-id })))
+  )
+    (if (get surge-active metrics)
+      (some (/ (* base-price (var-get surge-multiplier)) u100))
+      (if (get discount-active metrics)
+        (some (/ (* base-price (var-get discount-percentage)) u100))
+        (some base-price)
+      )
+    )
+  )
+)
+
+(define-private (remove-rental-id (id uint))
+  (not (is-eq id (var-get next-rental-id)))
+)
+
 (define-public (create-outfit 
   (name (string-utf8 64))
   (description (string-utf8 256))
@@ -99,6 +210,17 @@
         category: category
       }
     )
+    (map-set outfit-demand-metrics
+      { outfit-id: outfit-id }
+      {
+        recent-rental-count: u0,
+        last-rental-time: u0,
+        price-tier: u1,
+        surge-active: false,
+        discount-active: false,
+        last-price-update: (var-get current-time)
+      }
+    )
     (var-set next-outfit-id (+ outfit-id u1))
     (ok outfit-id)
   )
@@ -110,7 +232,8 @@
     (rental-id (var-get next-rental-id))
     (current-timestamp (var-get current-time))
     (end-timestamp (+ current-timestamp duration-hours))
-    (total-cost (* (get rental-price-per-hour outfit) duration-hours))
+    (dynamic-price (unwrap! (get-dynamic-price outfit-id) err-not-found))
+    (total-cost (* dynamic-price duration-hours))
     (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u100))
     (owner-payment (- total-cost platform-fee))
   )
@@ -156,6 +279,8 @@
         }
       )
     )
+    
+    (unwrap! (update-demand-metrics outfit-id) err-not-found)
     
     (var-set next-rental-id (+ rental-id u1))
     (ok rental-id)
@@ -400,6 +525,127 @@
   (var-get next-review-id)
 )
 
-(define-private (remove-rental-id (id uint))
-  (not (is-eq id (var-get next-rental-id)))
+
+(define-public (trigger-price-update (outfit-id uint))
+  (let (
+    (outfit (unwrap! (map-get? outfits { outfit-id: outfit-id }) err-not-found))
+    (metrics (unwrap! (map-get? outfit-demand-metrics { outfit-id: outfit-id }) err-not-found))
+    (current-timestamp (var-get current-time))
+    (time-since-update (- current-timestamp (get last-price-update metrics)))
+  )
+    (asserts! (is-eq tx-sender (get owner outfit)) err-unauthorized)
+    (asserts! (>= time-since-update (var-get price-update-cooldown)) err-cooldown-period)
+    
+    (let (
+      (current-week (get-current-week))
+      (weekly-rentals (default-to { rental-count: u0 }
+        (map-get? weekly-rental-tracker { outfit-id: outfit-id, week-number: current-week })))
+      (rental-count (get rental-count weekly-rentals))
+      (should-surge (>= rental-count (var-get surge-threshold)))
+      (days-since-rental (/ (- current-timestamp (get last-rental-time metrics)) u24))
+      (should-discount (and (< rental-count u2) (>= days-since-rental (var-get discount-threshold))))
+      (new-tier (if should-surge u3 (if should-discount u0 u1)))
+    )
+      (map-set outfit-demand-metrics
+        { outfit-id: outfit-id }
+        (merge metrics {
+          price-tier: new-tier,
+          surge-active: should-surge,
+          discount-active: should-discount,
+          last-price-update: current-timestamp
+        })
+      )
+      
+      (let (
+        (base-price (get rental-price-per-hour outfit))
+        (adjusted-price (if should-surge
+          (/ (* base-price (var-get surge-multiplier)) u100)
+          (if should-discount
+            (/ (* base-price (var-get discount-percentage)) u100)
+            base-price)))
+        (adjustment-type (if should-surge u"surge" (if should-discount u"discount" u"normal")))
+      )
+        (map-set outfit-price-history
+          { outfit-id: outfit-id, timestamp: current-timestamp }
+          {
+            base-price: base-price,
+            adjusted-price: adjusted-price,
+            adjustment-type: adjustment-type
+          }
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-surge-parameters (threshold uint) (multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> threshold u0) (<= threshold u10)) err-invalid-surge-rate)
+    (asserts! (and (>= multiplier u100) (<= multiplier u300)) err-invalid-surge-rate)
+    (var-set surge-threshold threshold)
+    (var-set surge-multiplier multiplier)
+    (ok true)
+  )
+)
+
+(define-public (set-discount-parameters (threshold-days uint) (percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> threshold-days u0) (<= threshold-days u30)) err-invalid-surge-rate)
+    (asserts! (and (>= percentage u50) (<= percentage u100)) err-invalid-surge-rate)
+    (var-set discount-threshold threshold-days)
+    (var-set discount-percentage percentage)
+    (ok true)
+  )
+)
+
+(define-read-only (get-outfit-demand-metrics (outfit-id uint))
+  (map-get? outfit-demand-metrics { outfit-id: outfit-id })
+)
+
+(define-read-only (get-outfit-price-history (outfit-id uint) (timestamp uint))
+  (map-get? outfit-price-history { outfit-id: outfit-id, timestamp: timestamp })
+)
+
+(define-read-only (get-weekly-rentals (outfit-id uint) (week-number uint))
+  (default-to { rental-count: u0 }
+    (map-get? weekly-rental-tracker { outfit-id: outfit-id, week-number: week-number }))
+)
+
+(define-read-only (get-surge-settings)
+  {
+    threshold: (var-get surge-threshold),
+    multiplier: (var-get surge-multiplier)
+  }
+)
+
+(define-read-only (get-discount-settings)
+  {
+    threshold-days: (var-get discount-threshold),
+    percentage: (var-get discount-percentage)
+  }
+)
+
+(define-read-only (calculate-dynamic-rental-cost (outfit-id uint) (duration-hours uint))
+  (match (get-dynamic-price outfit-id)
+    price-per-hour
+      (let (
+        (total-cost (* price-per-hour duration-hours))
+        (platform-fee (/ (* total-cost (var-get platform-fee-percentage)) u100))
+      )
+        (some {
+          price-per-hour: price-per-hour,
+          total-cost: total-cost,
+          platform-fee: platform-fee,
+          owner-payment: (- total-cost platform-fee),
+          pricing-tier: (match (map-get? outfit-demand-metrics { outfit-id: outfit-id })
+            metrics (get price-tier metrics)
+            u1
+          )
+        })
+      )
+    none
+  )
 )
