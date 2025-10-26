@@ -13,6 +13,9 @@
 (define-constant err-invalid-rating (err u111))
 (define-constant err-invalid-surge-rate (err u112))
 (define-constant err-cooldown-period (err u113))
+(define-constant err-invalid-deposit (err u114))
+(define-constant err-insufficient-balance (err u115))
+(define-constant err-no-rewards (err u116))
 
 (define-data-var next-outfit-id uint u1)
 (define-data-var next-rental-id uint u1)
@@ -24,6 +27,7 @@
 (define-data-var discount-threshold uint u7)
 (define-data-var discount-percentage uint u80)
 (define-data-var price-update-cooldown uint u24)
+(define-data-var loyalty-reward-percentage uint u10)
 
 (define-map outfits
   { outfit-id: uint }
@@ -110,6 +114,16 @@
 (define-map weekly-rental-tracker
   { outfit-id: uint, week-number: uint }
   { rental-count: uint }
+)
+
+(define-map user-loyalty-wallet
+  { user: principal }
+  { balance: uint, total-earned: uint, last-updated: uint }
+)
+
+(define-map user-rental-count
+  { user: principal }
+  { count: uint }
 )
 
 (define-private (get-current-week)
@@ -281,6 +295,27 @@
     )
     
     (unwrap! (update-demand-metrics outfit-id) err-not-found)
+    
+    (let (
+      (user-rentals-data (default-to { count: u0 } (map-get? user-rental-count { user: tx-sender })))
+      (new-count (+ (get count user-rentals-data) u1))
+      (reward-amount (/ (* total-cost (var-get loyalty-reward-percentage)) u100))
+      (wallet (default-to { balance: u0, total-earned: u0, last-updated: u0 } 
+                          (map-get? user-loyalty-wallet { user: tx-sender })))
+    )
+      (map-set user-rental-count
+        { user: tx-sender }
+        { count: new-count }
+      )
+      (map-set user-loyalty-wallet
+        { user: tx-sender }
+        {
+          balance: (+ (get balance wallet) reward-amount),
+          total-earned: (+ (get total-earned wallet) reward-amount),
+          last-updated: (var-get current-time)
+        }
+      )
+    )
     
     (var-set next-rental-id (+ rental-id u1))
     (ok rental-id)
@@ -648,4 +683,63 @@
       )
     none
   )
+)
+
+(define-public (deposit-loyalty-tokens (amount uint))
+  (let (
+    (wallet (default-to { balance: u0, total-earned: u0, last-updated: u0 } 
+                        (map-get? user-loyalty-wallet { user: tx-sender })))
+  )
+    (asserts! (> amount u0) err-invalid-deposit)
+    (try! (stx-transfer? amount tx-sender contract-owner))
+    (map-set user-loyalty-wallet
+      { user: tx-sender }
+      {
+        balance: (+ (get balance wallet) amount),
+        total-earned: (get total-earned wallet),
+        last-updated: (var-get current-time)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (redeem-loyalty-rewards (amount uint))
+  (let (
+    (wallet (unwrap! (map-get? user-loyalty-wallet { user: tx-sender }) err-not-found))
+  )
+    (asserts! (> amount u0) err-invalid-deposit)
+    (asserts! (>= (get balance wallet) amount) err-insufficient-balance)
+    (try! (stx-transfer? amount contract-owner tx-sender))
+    (map-set user-loyalty-wallet
+      { user: tx-sender }
+      {
+        balance: (- (get balance wallet) amount),
+        total-earned: (get total-earned wallet),
+        last-updated: (var-get current-time)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-loyalty-reward-percentage (percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= percentage u20) err-invalid-surge-rate)
+    (var-set loyalty-reward-percentage percentage)
+    (ok true)
+  )
+)
+
+(define-read-only (get-loyalty-wallet (user principal))
+  (map-get? user-loyalty-wallet { user: user })
+)
+
+(define-read-only (get-user-rental-count (user principal))
+  (default-to { count: u0 } (map-get? user-rental-count { user: user }))
+)
+
+(define-read-only (get-loyalty-reward-percentage)
+  (var-get loyalty-reward-percentage)
 )
