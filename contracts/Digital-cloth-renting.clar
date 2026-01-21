@@ -16,6 +16,9 @@
 (define-constant err-invalid-deposit (err u114))
 (define-constant err-insufficient-balance (err u115))
 (define-constant err-no-rewards (err u116))
+(define-constant err-wishlist-full (err u117))
+(define-constant err-already-in-wishlist (err u118))
+(define-constant err-not-in-wishlist (err u119))
 
 (define-data-var next-outfit-id uint u1)
 (define-data-var next-rental-id uint u1)
@@ -124,6 +127,11 @@
 (define-map user-rental-count
   { user: principal }
   { count: uint }
+)
+
+(define-map user-wishlist
+  { user: principal }
+  { outfit-ids: (list 20 uint) }
 )
 
 (define-private (get-current-week)
@@ -742,4 +750,61 @@
 
 (define-read-only (get-loyalty-reward-percentage)
   (var-get loyalty-reward-percentage)
+)
+
+(define-data-var wishlist-removal-target uint u0)
+
+(define-private (is-outfit-in-list (outfit-id uint) (outfit-list (list 20 uint)))
+  (is-some (index-of? outfit-list outfit-id))
+)
+
+(define-private (is-not-removal-target (current uint))
+  (not (is-eq current (var-get wishlist-removal-target)))
+)
+
+(define-public (add-to-wishlist (outfit-id uint))
+  (let (
+    (wishlist (default-to { outfit-ids: (list ) } (map-get? user-wishlist { user: tx-sender })))
+    (current-list (get outfit-ids wishlist))
+  )
+    (asserts! (is-some (map-get? outfits { outfit-id: outfit-id })) err-not-found)
+    (asserts! (< (len current-list) u20) err-wishlist-full)
+    (asserts! (not (is-outfit-in-list outfit-id current-list)) err-already-in-wishlist)
+    (map-set user-wishlist
+      { user: tx-sender }
+      { outfit-ids: (unwrap! (as-max-len? (append current-list outfit-id) u20) err-wishlist-full) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-from-wishlist (outfit-id uint))
+  (let (
+    (wishlist (unwrap! (map-get? user-wishlist { user: tx-sender }) err-not-found))
+    (current-list (get outfit-ids wishlist))
+  )
+    (asserts! (is-outfit-in-list outfit-id current-list) err-not-in-wishlist)
+    (var-set wishlist-removal-target outfit-id)
+    (map-set user-wishlist
+      { user: tx-sender }
+      { outfit-ids: (filter is-not-removal-target current-list) }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-wishlist (user principal))
+  (default-to { outfit-ids: (list ) } (map-get? user-wishlist { user: user }))
+)
+
+(define-read-only (is-in-wishlist (user principal) (outfit-id uint))
+  (let (
+    (wishlist (default-to { outfit-ids: (list ) } (map-get? user-wishlist { user: user })))
+  )
+    (is-outfit-in-list outfit-id (get outfit-ids wishlist))
+  )
+)
+
+(define-read-only (get-wishlist-count (user principal))
+  (len (get outfit-ids (default-to { outfit-ids: (list ) } (map-get? user-wishlist { user: user }))))
 )
